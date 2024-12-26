@@ -6,7 +6,7 @@ from rich.markdown import Markdown # type: ignore
 from rich.prompt import Confirm # type: ignore
 
 from langchain_openai import ChatOpenAI # type: ignore
-from langchain_core.messages import HumanMessage, SystemMessage # type: ignore
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage # type: ignore
 
 from typing import Annotated, List, Optional
 
@@ -87,17 +87,24 @@ def refine_agent(state: State, llm: ChatOpenAI, console: Console):
     system_message = SystemMessage(system_prompt)
     while True:
 
-        user_input = console.input("[bold blue]Ask your question (type 'exit' to quit): [/bold blue]")
+        user_input = console.input("[bold blue]Ask your question (type 'exit' to quit, 'again' to generate a new answer, 'discard' to discard your previous input): [/bold blue]")
         
         if user_input.lower() == "exit":
             console.print("[bold green]Goodbye![/bold green]")
             state["end"] = True
             return state
+        elif user_input.lower() == "discard":
+            state["refine_agent"]["messages"].pop()
+            state["refine_agent"]["messages"].pop()
+
         else:
             try:
-                user_message = HumanMessage(content=user_input)
-                state["refine_agent"]["messages"].append(user_message)
-
+                if user_input.lower() == "again":
+                    state["refine_agent"]["messages"].pop()
+                else:
+                    user_message = HumanMessage(content=user_input)
+                    state["refine_agent"]["messages"].append(user_message)
+                
                 if state["refine_agent"]["iterations"] == 3:
                     if Confirm.ask("\n[yellow]End query refinement?[/yellow]"):
                         new_state = RefineAgentState(
@@ -112,8 +119,11 @@ def refine_agent(state: State, llm: ChatOpenAI, console: Console):
                     else:
                         state["refine_agent"]["iterations"] = 0
                 
-                response = llm.invoke(state["refine_agent"]["messages"] + [system_message])
-                response_message = response.content
+                response = None                    
+                while response is None or not check_answer_quality(llm, system_message, response):
+                    print("Refining...")
+                    response = llm.invoke(state["refine_agent"]["messages"] + [system_message])
+                    response_message = response.content
 
                 if "done" in response_message.lower():
                     new_state = RefineAgentState(
@@ -136,18 +146,68 @@ def refine_agent(state: State, llm: ChatOpenAI, console: Console):
                 console.print(f"[bold red]An error occurred: {e}[/bold red]")
 
 def build_query(state: State, llm: ChatOpenAI) -> State:
-    #TODO
     print("BuildQueryAgent")
 
-    query = SearchQuery(
-        query="Test Query",
-        summary="This is a test query used during development."
-    )
+    system_prompt = """
+    You are an AI agent specialized in crafting SearchQuery objects from conversations between a user and an LLM.
+    The SearchQuery object is defined as follows:
+    class SearchQuery(TypedDict):
+        query: str # The main query
+        queries: Optional[List[str]] # Additional augmented / expanded queries
+        start_date: Optional[Date] # The oldest date allowed during our researches in YYYY-MM-DD format, if mentioned (i.e., Papers should not be older)
+        end_date: Optional[Date] # The most recent date allowed during our researched in YYYY-MM-DD format, if mentioned (i.e., Papers should not be more recent)
+    
+    Format your response as a JSON object with these fields:
+        - query (str): The main query ;
+        - queries (Optional[List[str]]): Additional augmented / expanded queries ;
+        - start_date (Optional[str]): The oldest date allowed during our researches in YYYY-MM-DD format, if mentioned (i.e., Papers should not be older) ;
+        - end_date (Optional[str]): The most recent date allowed during our researched in YYYY-MM-DD format, if mentioned (i.e., Papers should not be more recent) ;
+    
+    Include only fields that are clearly specified in the conversation.
+    Your output should be the raw JSON object and not its markdown representation (i.e., ```json ...```)
+    """
 
-    state["search_agent"]["search_query"] = query
+    system_message = SystemMessage(system_prompt)
+
+    try:
+        response = llm.invoke(state["refine_agent"]["messages"] + [system_message])
+        raw_object = response.content
+        raw_object = raw_object.replace("null", "None").replace("```json", "").replace("```", "")
+        search_query: SearchQuery = eval(raw_object)
+
+        if not search_query.get("query"):
+            raise ValueError("Search query must contain a main query")
+        if search_query.get("start_date"):
+            year, month, day = map(int, search_query["start_date"].split("-"))
+            search_query["start_date"] = Date(year, month, day)
+        if search_query.get("end_date"):
+            year, month, day = map(int, search_query["end_date"].split("-"))
+            search_query["end_date"] = Date(year, month, day)
+
+        state["search_agent"]["search_query"] = search_query
+    except Exception as e:
+        #TODO
+        print(e)
 
     return state
 
+def check_answer_quality(llm: ChatOpenAI, initial_system_message: SystemMessage, llm_output: AIMessage):
+    print("Checking Answer")
+    system_prompt = f"""
+    Determine if this output: {llm_output.content} aligns with the initial SystemMessage: {initial_system_message.content}.
+    If it aligns, return 'continue', otherwise return 'redo'.
+    """
+
+    system_message = SystemMessage(system_prompt)
+
+    response = llm.invoke([system_message])
+
+    if "continue" in response.content.lower():
+        return True
+    
+    return False
+    
+    
 def search_agent(state: State, llm: ChatOpenAI):
     #TODO
     print("SearchAgent")
