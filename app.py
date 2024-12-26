@@ -32,7 +32,6 @@ DEFAULT_CONFIG = {"configurable": {"thread_id": "1"}}
 class SearchQuery(TypedDict):
     query: str
     queries: Optional[List[str]]
-    keywords: Optional[List[str]]
     start_date: Optional[Date]
     end_date: Optional[Date]
 
@@ -63,6 +62,7 @@ class SearchAgentState(TypedDict):
 class State(TypedDict):
     refine_agent: RefineAgentState
     search_agent: SearchAgentState
+    end: bool
 
 def refine_agent(state: State, llm: ChatOpenAI, console: Console):
     print("RefineAgent")
@@ -91,6 +91,8 @@ def refine_agent(state: State, llm: ChatOpenAI, console: Console):
         
         if user_input.lower() == "exit":
             console.print("[bold green]Goodbye![/bold green]")
+            state["end"] = True
+            return state
         else:
             try:
                 user_message = HumanMessage(content=user_input)
@@ -169,7 +171,14 @@ def build_graph(llm: ChatOpenAI, memory: MemorySaver, console: Console):
 
     workflow.add_edge(START, "RefineAgent")
 
-    workflow.add_edge("RefineAgent", "BuildQueryAgent")
+    workflow.add_conditional_edges(
+        "RefineAgent", 
+        lambda s: END if s["end"] else "BuildQueryAgent",
+        {
+            "BuildQueryAgent": "BuildQueryAgent",
+            END: END,
+        }
+    )
 
     workflow.add_edge("BuildQueryAgent", "SearchAgent")
 
@@ -215,6 +224,7 @@ def initialize_agent_state(mode: str):
         {
             "refine_agent": refine_agent_state,
             "search_agent": search_agent_state,
+            "end": False,
         }
     )
 
