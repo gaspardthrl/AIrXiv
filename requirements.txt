@@ -1,0 +1,8 @@
+requests
+Pillow
+PyPDF2
+python-dotenv
+rich
+langchain_openai==0.2.10
+langchain_community==0.3.8
+langgraph==0.2.60

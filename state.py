@@ -1,17 +1,14 @@
-# state.py
-
 from typing import Annotated, List, Optional
 from typing_extensions import TypedDict # type: ignore
 from datetime import datetime as Datetime
 from langgraph.graph.message import add_messages # type: ignore
 
-# Define Search Query Class
 class SearchQuery(TypedDict):
+    goal: str
     queries: List[str]
     start_date: Optional[Datetime]
     end_date: Optional[Datetime]
 
-# Define Paper Class
 class Paper(TypedDict):
     title: str
     summary: str
@@ -21,21 +18,18 @@ class Paper(TypedDict):
     updated: Optional[Datetime]
     authors: Optional[List[str]]
 
-# Define Arxiv Paper Class
 class ArxivPaper(TypedDict):
     paper: Paper
     keywords: Optional[List[str]]
     sources: Optional[List[Paper]]
     relevant: Optional[bool]
 
-# Define Refine Agent State
 class RefineAgentState(TypedDict):
     messages: Annotated[list, add_messages]
     mode: str
     done: bool
     iterations: int
 
-# Define Search Agent State
 class SearchAgentState(TypedDict):
     messages: Annotated[list, add_messages]
     search_query: Optional[SearchQuery]
@@ -44,13 +38,11 @@ class SearchAgentState(TypedDict):
     iterations: int
     done: bool
 
-# Define the Main State
 class State(TypedDict):
     refine_agent: RefineAgentState
     search_agent: SearchAgentState
     end: bool
 
-# Initialize Agent State
 def initialize_agent_state(mode: str) -> State:
     refine_agent_state = RefineAgentState(
         {

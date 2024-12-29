@@ -1,8 +1,16 @@
 import os
+import re
+import json
+import io
+from io import BytesIO
 from typing import List, Optional
-
-import requests
+from PIL import Image # type: ignore
+import PyPDF2 # type: ignore
+import requests # type: ignore
 from dotenv import load_dotenv # type: ignore
+from datetime import datetime as Datetime
+
+import xml.etree.ElementTree as ET
 
 from rich.console import Console # type: ignore
 from rich.markdown import Markdown # type: ignore
@@ -10,40 +18,51 @@ from rich.prompt import Confirm # type: ignore
 
 from langchain_openai import ChatOpenAI # type: ignore
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage # type: ignore
-
-from typing_extensions import TypedDict # type: ignore
-
-
-import xml.etree.ElementTree as ET
-
-from state import State, SearchAgentState, RefineAgentState, ArxivPaper, Paper, SearchQuery, initialize_agent_state # type: ignore
+from langchain_community.tools.tavily_search import TavilySearchResults # type: ignore
 
 from langgraph.graph import StateGraph, START, END # type: ignore
-from langgraph.graph.message import add_messages # type: ignore
 from langgraph.checkpoint.memory import MemorySaver # type: ignore
 
-from IPython.display import Image, display # type: ignore
-from langchain_core.runnables.graph import CurveStyle, MermaidDrawMethod, NodeStyles # type: ignore
+from langchain_core.runnables.graph import MermaidDrawMethod # type: ignore
+from langchain_core.messages import ToolMessage # type: ignore
 
-import io
-from PIL import Image # type: ignore
-
-from datetime import datetime as Datetime
-
-import requests
-import re
-import PyPDF2
-from io import BytesIO
-
+from state import State, ArxivPaper, Paper, SearchQuery, initialize_agent_state # type: ignore
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_MODE = 'human'
 DEFAULT_CONFIG = {"configurable": {"thread_id": "1"}}
 
+class BasicToolNode:
+    
+    def __init__(self, tools: list) -> None:
+        self.tools_by_name = {tool.name: tool for tool in tools}
+
+    def __call__(self, inputs: dict):
+        if messages := inputs["refine_agent"].get("messages", []):
+            message = messages[-1]
+        else:
+            raise ValueError("No message found in input")
+        outputs = []
+        for tool_call in message.tool_calls:
+            tool_result = self.tools_by_name[tool_call["name"]].invoke(
+                tool_call["args"]
+            )
+            outputs.append(
+                ToolMessage(
+                    content=json.dumps(tool_result),
+                    name=tool_call["name"],
+                    tool_call_id=tool_call["id"],
+                )
+            )
+
+        return {"refine_agent": {**inputs["refine_agent"], "messages": inputs["refine_agent"]["messages"] + outputs }}
 
 class ArxivAgent:
     def __init__(self, llm: ChatOpenAI, console: Console, mode: str, stream_mode: str = "values", memory: MemorySaver = MemorySaver(), config = DEFAULT_CONFIG):
-        self.llm = llm
+        
+        self.tools = [TavilySearchResults(max_results=5)]
+        self.llm = llm.bind_tools(self.tools)
+        
         self.console = console
         
         self.stream_mode = stream_mode
@@ -59,47 +78,64 @@ class ArxivAgent:
         self.namespace = {'ns': 'http://www.w3.org/2005/Atom'}
         self.base_url = 'http://export.arxiv.org/api/query?'
 
+
     def _build_graph(self) -> None:
         workflow = StateGraph(State)
-        workflow.add_node("RefineAgent", lambda s: self._refine_agent(s))
-        workflow.add_node("BuildQueryAgent", lambda s: self._build_query(s))
+        workflow.add_node("Refine", lambda s: self._refine_agent(s))
+        workflow.add_node("Browse", lambda s: self._browse_agent(s))
+        workflow.add_node("BuildQuery", lambda s: self._build_query(s))
         workflow.add_node("QueryArxiv", lambda s: self._query_arxiv(s))
         workflow.add_node("ReviewPapers", lambda s: self._review_papers(s))
         workflow.add_node("SourcesExtraction", lambda s: self._extract_sources(s))
-        workflow.add_node("BuildAnswerAgent", lambda s: self._build_answer(s))
+        workflow.add_node("BuildAnswer", lambda s: self._build_answer(s))
 
-        workflow.add_edge(START, "RefineAgent")
+        tool_node = BasicToolNode(tools=self.tools)
+        workflow.add_node("tools", tool_node)
 
         workflow.add_conditional_edges(
-            "RefineAgent", 
-            lambda s: END if s["end"] else "BuildQueryAgent",
+            "Browse",
+            lambda s: "Tavily Search Tool" if s["refine_agent"]["messages"][-1].tool_calls else "Build Query",
             {
-                "BuildQueryAgent": "BuildQueryAgent",
+                "Tavily Search Tool": "tools",
+                "Build Query": "BuildQuery",
+            }
+        )
+
+        workflow.add_edge("tools", "Browse")
+
+        workflow.add_edge(START, "Refine")
+
+        workflow.add_conditional_edges(
+            "Refine", 
+            lambda s: END if s["end"] else "Browse",
+            {
+                "Browse": "Browse",
                 END: END,
             }
         )
 
-        workflow.add_edge("BuildQueryAgent", "QueryArxiv")
+        workflow.add_edge("BuildQuery", "QueryArxiv")
         workflow.add_edge("QueryArxiv", "ReviewPapers")
 
         workflow.add_conditional_edges(
             "ReviewPapers", 
-            lambda s: "BuildAnswerAgent" if s["search_agent"]["done"] else "SourcesExtraction",
+            lambda s: "Wrap-Up" if s["search_agent"]["done"] else "Extract Sources",
             {
-                "BuildAnswerAgent": "BuildAnswerAgent",
-                "SourcesExtraction": "SourcesExtraction",
+                "Wrap-Up": "BuildAnswer",
+                "Extract Sources": "SourcesExtraction",
             }
         )
 
         workflow.add_edge("SourcesExtraction", "QueryArxiv")
 
-        workflow.add_edge("BuildAnswerAgent", END)
+        workflow.add_edge("BuildAnswer", END)
 
         self.workflow = workflow.compile(checkpointer=self.memory)
 
         return
     
     def run(self) -> None:
+        self.console.print(Markdown("---"))
         self.console.print(Markdown(f"# Refining Query"))
         self.workflow.invoke(self.state, config = self.config, stream_mode = self.stream_mode)
     
@@ -145,68 +181,113 @@ class ArxivAgent:
         """
 
         system_message = SystemMessage(system_prompt)
+        self.console.print(
+            "[bold cyan]Welcome to the Research Query Refinement Assistant!\n"
+            "You can interact with me in the following ways:\n"
+            "- Enter your query directly to start refining it.\n"
+            "- Type 'exit' to leave the session at any time.\n"
+            "- After receiving a response, you can type 'again' to retry or 'discard' to remove the last response.\n"
+            "- When you're satisfied with the refinement, type 'next' to proceed to the next phase.[/bold cyan]"
+        )
+        
+        self.console.print(Markdown("---"))
 
         while True:
-            user_input = self.console.input("[bold blue]Ask your question (type 'exit' to quit, 'again' to generate a new answer, 'discard' to discard your previous input, 'next' to start the search phase): [/bold blue]\n")
+            user_input = self.console.input("[bold blue]Ask your question: [/bold blue]")
             
             if user_input.lower() == "exit":
                 self.console.print("[bold green]Goodbye![/bold green]")
                 return {**state, "end": True}
             elif user_input.lower() == "discard":
-                state["refine_agent"]["messages"].pop()
-                state["refine_agent"]["messages"].pop()
+                if len(state["refine_agent"]["messages"]) > 2:
+                    state["refine_agent"]["messages"].pop()
+                    state["refine_agent"]["messages"].pop()
             else:
                 try:
                     if user_input.lower() == "again":
-                        state["refine_agent"]["messages"].pop()
+                        if state["refine_agent"]["messages"] and type(state["refine_agent"]["messages"][-1]) is AIMessage:
+                            state["refine_agent"]["messages"].pop()
                     elif user_input.lower() == "next":
-                        self.console.print(Markdown(f"# Building Query"))
+                        if state["refine_agent"]["messages"] and type(state["refine_agent"]["messages"][-1]) is AIMessage:
+                            state["refine_agent"]["messages"].pop()
+                        
+                        self.console.print(Markdown("---"))
+                        self.console.print(Markdown(f"# Browsing Query"))
                         return {**state, "refine_agent": {**state["refine_agent"], "done": True}}
                     else:
                         user_message = HumanMessage(content=user_input)
                         state["refine_agent"]["messages"].append(user_message)
                     
+                    # TODO: Improve logic
                     response = None
                     counter = 0                    
                     while response is None or not self._check_answer_quality(system_message, response):
                         response = self.llm.invoke(state["refine_agent"]["messages"] + [system_message])
                         response_message = response.content
-                        
                         if counter > 3: 
                             break
                         
                         counter += 1
 
                     if "done" in response_message.lower():
-                        self.console.print(Markdown(f"# Building Query"))
+                        self.console.print(Markdown("---"))
+                        self.console.print(Markdown(f"# Browsing Query"))
                         return {**state, "refine_agent": {**state["refine_agent"], "done": True}}
                     
                     state["refine_agent"]["messages"].append(response)
 
+                    self.console.print(Markdown("## Agent's Response"))
                     self.console.print(Markdown(response_message))
+                    self.console.print(Markdown("---"))
 
                     state["refine_agent"]["iterations"] += 1
                 
                 except Exception as e:
                     self.console.print(f"[bold red]An error occurred: {e}[/bold red]")
     
-    def _build_query(self, state: State) -> State:
+    def _browse_agent(self, state: State) -> State:
+        
         system_prompt = """
-        You are an AI agent specialized in crafting SearchQuery objects from conversations between a user and an LLM.
-        The SearchQuery object is defined as follows:
+            Given a message history between the user and a llm, your goal is to browse the web and add to the context of the query. It might be relevant to query the web multiple times given the responses you get.
+            """
+        
+        system_message = SystemMessage(system_prompt)
+        
+        response = self.llm.invoke(state["refine_agent"]["messages"] + [system_message])
+        
+        state["refine_agent"]["messages"].append(response)
+        
+        return state
+        
+    def _build_query(self, state: State) -> State:
+        self.console.print(Markdown(f"# Building Query"))
+        system_prompt = """
+        You are an AI assistant specialized in generating SearchQuery objects for querying research databases like arXiv. A SearchQuery object is structured as follows:
+
         class SearchQuery(TypedDict):
-            queries: List[str] # main query and additional augmented / expanded queries
-            start_date: Optional[Datetime] # The oldest date allowed during our researches in YYYY-MM-DD format, if mentioned (i.e., Papers should not be older)
-            end_date: Optional[Datetime] # The most recent date allowed during our researched in YYYY-MM-DD format, if mentioned (i.e., Papers should not be more recent)
+            goal: str # User's intent
+            queries: List[str]  # Main query and additional expanded queries
+            start_date: Optional[str]  # The earliest publication date allowed in YYYY-MM-DD format, if specified
+            end_date: Optional[str]  # The latest publication date allowed in YYYY-MM-DD format, if specified
+
+        ### Your Task:
+        1. Based on the given conversation, generate a **SearchQuery** JSON object containing:
+        - **goal (str)**: The global intent of the user. Used later to determine whether a retrieved paper is relevant or not even though it the queries.
+        - **queries (List[str])**: The main search query and any additional refined or expanded queries to maximize relevance.
+        - **start_date (Optional[str])**: If the user specifies a start date, include it in YYYY-MM-DD format.
+        - **end_date (Optional[str])**: If the user specifies an end date, include it in YYYY-MM-DD format.
         
-        Format your response as a JSON object with these fields:
-            - queries List[str]: Main query and additional augmented / expanded queries ;
-            - start_date (Optional[str]): The oldest date allowed during our researches in YYYY-MM-DD format, if mentioned (i.e., Papers should not be older) ;
-            - end_date (Optional[str]): The most recent date allowed during our researched in YYYY-MM-DD format, if mentioned (i.e., Papers should not be more recent) ;
-        
-        Include only fields that are clearly specified in the conversation.
-        Your output should be the raw JSON object and not its markdown representation (i.e., ```json ...```)
-        The generated queries should be formulated to maximize their relevance during research phase.
+        2. **Adhere to these rules:**
+        - Include only fields explicitly mentioned in the conversation. If a field is not discussed, omit it.
+        - Ensure queries are relevant and formatted to maximize effectiveness in arXiv searches (e.g., concise, leveraging logical operators or field-specific syntax if applicable).
+
+        3. **Output Format:**
+        - Return only the raw JSON object with no additional explanations, code blocks, or markdown formatting.
+        - Ensure JSON is syntactically correct and ready for parsing.
+
+        ### Additional Notes:
+        - If the user implies multiple possible queries, include them as additional entries in the `queries` list.
+        - Avoid including unrelated or overly broad terms.
         """
 
         system_message = SystemMessage(system_prompt)
@@ -231,12 +312,10 @@ class ArxivAgent:
             self.console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
         
         self.console.print(Markdown(f"# Browsing Through arXiv"))
-
         return state
 
-    def _query_arxiv(self, state: State, max_results: int = 5) -> State:
+    def _query_arxiv(self, state: State, max_results: int = 3) -> State:
         def _fetch_papers(search_query: str):
-            """Fetch papers from arXiv API based on a specific query."""
             try:
                 response = requests.get(self.base_url + search_query)
                 response.raise_for_status()
@@ -288,16 +367,13 @@ class ArxivAgent:
             except Exception as e:
                 self.console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
 
-        # Main Logic
         if state["search_agent"]["papers_id"]:
-            # Fetch papers based on existing relevant papers
             for paper in state["search_agent"]["papers"]:
                 if paper.get("relevant", None):
                     id_list = ",".join(paper["sources"] or [])
                     search_query = f'id_list={id_list}'
                     _fetch_papers(search_query)
         else:
-            # Fetch papers based on initial queries
             for query in state["search_agent"]["search_query"].get("queries", []):
                 search_query = f'search_query=all:{query}&start=0&max_results={max_results}'
                 _fetch_papers(search_query)
@@ -305,32 +381,56 @@ class ArxivAgent:
         return state
     
     def _review_papers(self, state: State) -> State:
-        def _is_paper_relevant(paper: ArxivPaper, search_query: SearchQuery) -> bool:
+        def _is_paper_relevant(paper: ArxivPaper, search_query: SearchQuery) -> int:
             try:
                 system_prompt = f"""
-                Your goal is to determine whether a given paper is relevant to a search query.
-                The search query is: {search_query}
+                You are a research paper relevance evaluator. Your task is to analyze a research paper and determine its relevance to a specific search query.
 
-                You should return 'relevant' if the paper is relevant, and 'irrelevant' otherwise.
+                Search Query: {search_query}
+
+                Evaluation criteria:
+                - Score from 0 (completely irrelevant) to 10 (highly relevant)
+                - Consider both direct and indirect relevance to the query
+                - Factor in:
+                1. Title relevance
+                2. Abstract/summary content match
+                3. Methodology alignment (if mentioned)
+                4. Potential applications related to the query
+                
+                Return only a single integer score between 0 and 10. Do not include any explanation or additional text.
                 """
 
                 paper_prompt = f"""
-                Title: 
-                {paper['paper']['title']}
+                Title: {paper['paper']['title']}
+                Summary: {paper['paper']['summary']}
 
-                Summary:
-                {paper['paper']['summary']}
+                Based on the above content and the search query, provide a single integer score between 0 and 10.
                 """
 
-                system_message = SystemMessage(system_prompt)
-                paper_message = SystemMessage(paper_prompt)
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=paper_prompt)
+                ]
 
-                response = self.llm.invoke([system_message, paper_message])
-                return "irrelevant" not in response.content.lower()
-            
+                response = self.llm.invoke(messages)
+                
+                cleaned_response = response.content.strip()
+                
+                score_match = re.search(r'\b([0-9]|10)\b', cleaned_response)
+                
+                if score_match:
+                    score = int(score_match.group(1))
+                    return max(0, min(score, 10))
+                else:
+                    self.console.print(f"[yellow]Warning: Could not parse score for paper '{paper['paper']['title']}'. Defaulting to 0.[/yellow]")
+                    return 0
+
+            except ValueError as ve:
+                self.console.print(f"[bold yellow]Value error while evaluating '{paper['paper']['title']}': {ve}[/bold yellow]")
+                return 0
             except Exception as e:
-                self.console.print(f"[bold red]Error while evaluating relevance for {paper['paper']['title']}: {e}[/bold red]")
-                return False
+                self.console.print(f"[bold red]Error while evaluating '{paper['paper']['title']}': {e}[/bold red]")
+                return 0
 
         self.console.print("[bold cyan]Reviewing Papers for Relevance...[/bold cyan]")
         state["search_agent"]["done"] = True
@@ -339,21 +439,23 @@ class ArxivAgent:
             if paper.get("relevant") is not None:
                 continue
 
-            is_relevant = _is_paper_relevant(paper, state["search_agent"]["search_query"])
+            score = _is_paper_relevant(paper, state["search_agent"]["search_query"])
+
+            is_relevant = score > 6
 
             if is_relevant:
                 paper["relevant"] = True
                 state["search_agent"]["done"] = False
-                self.console.print(f"[bold green]✔ {paper['paper']['title']} deemed relevant.[/bold green]")
+                self.console.print(f"[bold green]✔ {paper['paper']['title']} deemed relevant with a score of {score}.[/bold green]")
             else:
                 paper["relevant"] = False
-                self.console.print(f"[bold yellow]✘ {paper['paper']['title']} deemed irrelevant.[/bold yellow]")
+                self.console.print(f"[bold yellow]✘ {paper['paper']['title']} deemed irrelevant with a score of {score}.[/bold yellow]")
         
 
         state["search_agent"]["iterations"] += 1
         
         # TODO: Improve routing logic
-        if state["search_agent"]["iterations"] == 3:
+        if state["search_agent"]["iterations"] == 2:
             state["search_agent"]["done"] = True
 
         return state
@@ -384,22 +486,21 @@ class ArxivAgent:
             }
             return list(references)
 
-        # Main Logic
         self.console.print("[bold cyan]Extracting sources from relevant papers...[/bold cyan]")
         for paper in state["search_agent"]["papers"]:
             if not paper.get("relevant", False):
-                continue  # Skip irrelevant papers
+                continue
 
             pdf_url = paper["paper"]["link"].replace("/abs/", "/pdf/")
             self.console.print(f"[bold blue]Processing PDF: {pdf_url}[/bold blue]")
 
             pdf_file = _fetch_pdf(pdf_url)
             if not pdf_file:
-                continue  # Skip if PDF couldn't be fetched
+                continue
 
             text = _extract_text_from_pdf(pdf_file)
             if not text:
-                continue  # Skip if text couldn't be extracted
+                continue
 
             sources = _extract_references(
                 text,
@@ -415,6 +516,7 @@ class ArxivAgent:
         return state
 
     def _build_answer(self, state: State) -> State:
+        self.console.print(Markdown("---"))
         self.console.print(Markdown(f"# Building Answer"))
         def _aggregate_relevant_papers(papers: List[ArxivPaper]) -> List[Paper]:
             return [
@@ -431,6 +533,7 @@ class ArxivAgent:
             return state
 
         self.console.print("[bold green]✔ Final Answer Compiled Successfully![/bold green]")
+        
         self.console.print(Markdown("# Papers"))
 
         for paper in relevant_papers:
@@ -441,10 +544,9 @@ class ArxivAgent:
             self.console.print(Markdown(f"{paper.get('link', 'No link found :(')}"))
             self.console.print("[bold cyan]Author(s):[/bold cyan]")
             self.console.print(Markdown(f"{', '.join(paper.get('authors', 'No author found :('))}"))
+            self.console.print(Markdown("---"))
 
         return state
-
-        
 
 def main():
     load_dotenv()
@@ -457,6 +559,7 @@ def main():
     mode = DEFAULT_MODE
 
     agent = ArxivAgent(llm, console, mode)
+
     try: 
         agent.run()
     except Exception as e:
