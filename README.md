@@ -1,8 +1,6 @@
-# AIrXiv
+![airxiv_logo](https://github.com/user-attachments/assets/3d562cf1-4c66-4181-8250-51dcc28940cf)
 
-## Overview
-
-**AIrXiv** is an intelligent agent designed to streamline the research paper discovery process. By leveraging conversational refinement, intelligent web browsing, and API querying, AIrXiv assists researchers in finding the most relevant papers from arXiv and related sources.
+**AIrXiv** is an agent designed to streamline the research paper discovery process. By leveraging conversational refinement, intelligent web browsing, and API querying, AIrXiv assists researchers in finding the most relevant papers from arXiv and related sources.
 
 ## Key Features
 
@@ -23,6 +21,10 @@
 5. **Paper Review:** Assess relevance based on pre-defined criteria.
 6. **Source Extraction:** Analyze PDFs of relevant papers to extract further references.
 7. **Final Report:** Present the final set of relevant papers with summaries and links.
+
+<div align="center">
+  <img src="agent_graph.png" alt="Description" width="300">
+</div>
 
 ## Installation
 
@@ -63,9 +65,6 @@ python app.py
 
 ## Demo
 https://github.com/user-attachments/assets/85b08428-0577-4cae-a195-1b406a7b5197
-
-## Agent Workflow Diagram
-![Diagram](agent_graph.png)
 
 ## License
 
