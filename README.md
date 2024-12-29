@@ -62,10 +62,9 @@ python app.py
 5. Receive a detailed report with titles, summaries, and links.
 
 ## Demo
+https://github.com/user-attachments/assets/85b08428-0577-4cae-a195-1b406a7b5197
 
 ## Agent Workflow Diagram
-
-Below is a representation of the AIrXiv workflow:
 ![Diagram](agent_graph.png)
 
 ## License
