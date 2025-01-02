@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from rich.console import Console # type: ignore
 from rich.markdown import Markdown # type: ignore
 from rich.prompt import Confirm # type: ignore
+from rich.prompt import Prompt # type: ignore
 
 from langchain_openai import ChatOpenAI # type: ignore
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage # type: ignore
@@ -29,7 +30,6 @@ from langchain_core.messages import ToolMessage # type: ignore
 from state import State, ArxivPaper, Paper, SearchQuery, initialize_agent_state # type: ignore
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_MODE = 'human'
 DEFAULT_CONFIG = {"configurable": {"thread_id": "1"}}
 
 class BasicToolNode:
@@ -62,6 +62,8 @@ class ArxivAgent:
         
         self.tools = [TavilySearchResults(max_results=5)]
         self.llm = llm.bind_tools(self.tools)
+
+        self.mode = mode
         
         self.console = console
         
@@ -81,6 +83,7 @@ class ArxivAgent:
 
     def _build_graph(self) -> None:
         workflow = StateGraph(State)
+        
         workflow.add_node("Refine", lambda s: self._refine_agent(s))
         workflow.add_node("Browse", lambda s: self._browse_agent(s))
         workflow.add_node("BuildQuery", lambda s: self._build_query(s))
@@ -217,6 +220,12 @@ class ArxivAgent:
                     else:
                         user_message = HumanMessage(content=user_input)
                         state["refine_agent"]["messages"].append(user_message)
+
+                    
+                    if self.mode == "auto":
+                        self.console.print(Markdown("---"))
+                        self.console.print(Markdown(f"# Browsing Query"))
+                        return {**state, "refine_agent": {**state["refine_agent"], "done": True}}
                     
                     # TODO: Improve logic
                     response = None
@@ -555,8 +564,7 @@ def main():
 
     llm = ChatOpenAI(model=OPENAI_MODEL)
     
-    # TODO: For now the mode is 'human' by default
-    mode = DEFAULT_MODE
+    mode = Prompt.ask("\n[yellow]Choose the query refinement feedbacks type[/yellow]", choices=["human", "auto"])
 
     agent = ArxivAgent(llm, console, mode)
 
